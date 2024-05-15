@@ -1,6 +1,7 @@
-use std::cmp;
 use std::fs::File;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
+
+use human_bytes::human_bytes;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use clap::Parser;
@@ -26,13 +27,11 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    #[clap(short, long, value_parser, default_value_t = 5)]
-    iterations: usize,
     #[clap(short, long, value_parser, default_value_t = 1000)]
     queries: usize,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
     println!("Running with {:#?}", args);
@@ -45,65 +44,33 @@ async fn main() -> Result<()> {
     ctx.register_parquet("yellow_tripdata", &filename, ParquetReadOptions::default())
         .await?;
 
-    // // execute the query
-    // let df = ctx
-    //     .sql("SELECT SUM(fare_amount) FROM yellow_tripdata")
-    //     .await?;
-
-    // // print the results
-    // df.show().await?;
-
-    // let now = Instant::now();
-    // let df = ctx
-    //     .sql(
-    //         "SELECT SUM(fare_amount) FROM yellow_tripdata \
-    //         WHERE tpep_dropoff_datetime >= '2022-01-30 00:00:00' \
-    //         AND tpep_dropoff_datetime < '2022-01-31 00:00:00'",
-    //     )
-    //     .await?;
-
-    // let res = df.collect().await;
-    // println!("Ran DF query in {:?}", now.elapsed());
-    // assert!(res.is_ok());
-    // // print the results
-    // // df.show().await?;
-
-    // let df = ctx.sql("SELECT * FROM yellow_tripdata LIMIT 1").await?;
-
-    // print the results
-    // df.show().await?;
-
-    // let df = ctx
-    //     .sql("SELECT MIN(tpep_dropoff_datetime), MAX(tpep_dropoff_datetime) FROM yellow_tripdata")
-    //     .await?;
-
-    // print the results
-    // df.show().await?;
-
     let now = Instant::now();
     let wheel = build_fare_wheel(filename);
     println!("Prepared wheel in {:?}", now.elapsed());
 
-    // Generate time ranges to query between 2022-01-01 and 2022-01-31
     let start_date = NaiveDate::from_ymd_opt(2022, 1, 1)
         .unwrap()
         .and_hms_opt(0, 0, 0)
         .unwrap()
-        .and_utc()
-        .timestamp_millis() as u64;
+        .and_utc();
 
     let end_date = NaiveDate::from_ymd_opt(2022, 1, 31)
         .unwrap()
         .and_hms_opt(0, 0, 0)
         .unwrap()
-        .and_utc()
-        .timestamp_millis() as u64;
+        .and_utc();
 
-    let ranges = generate_time_ranges(args.queries, start_date, end_date);
+    println!("===== MINUTE RANGES =====");
+    let min_ranges = generate_minute_time_ranges(start_date, end_date, args.queries);
 
-    // Bench SUM(fare_amount) BETWEEN timestamp and timestamp
-    bench_fare_wheel(wheel.read(), &ranges);
-    bench_fare_datafusion(&ctx, &ranges).await;
+    bench_fare_wheel(wheel.read(), &min_ranges);
+    bench_fare_datafusion(&ctx, &min_ranges).await;
+
+    println!("===== HOUR RANGES =====");
+
+    let hr_ranges = generate_hour_time_ranges(start_date, end_date, args.queries);
+    bench_fare_wheel(wheel.read(), &hr_ranges);
+    bench_fare_datafusion(&ctx, &hr_ranges).await;
 
     Ok(())
 }
@@ -114,12 +81,8 @@ fn build_fare_wheel(path: &str) -> RwWheel<F64SumAggregator> {
     let start = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
     let date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
     let start_ms = date.timestamp_millis() as u64;
-    dbg!(start_ms);
 
     let mut conf = HawConf::default().with_watermark(start_ms);
-
-    conf.seconds
-        .set_retention_policy(uwheel::RetentionPolicy::Keep);
 
     conf.minutes
         .set_retention_policy(uwheel::RetentionPolicy::Keep);
@@ -144,6 +107,7 @@ fn build_fare_wheel(path: &str) -> RwWheel<F64SumAggregator> {
 
     for batch in parquet_reader {
         let b = batch.unwrap();
+        // dbg!(b.schema());
         let dropoff_array = b
             .column_by_name("tpep_dropoff_datetime")
             .unwrap()
@@ -171,39 +135,63 @@ fn build_fare_wheel(path: &str) -> RwWheel<F64SumAggregator> {
         }
     }
     wheel.advance(31.days());
-    dbg!(wheel.size_bytes());
+    dbg!(wheel.read().as_ref().minutes_unchecked().len());
+    dbg!(wheel.read().as_ref().hours_unchecked().len());
+    dbg!(wheel.read().as_ref().days_unchecked().len());
+    dbg!(human_bytes(wheel.size_bytes() as u32));
     wheel
 }
 
-fn generate_time_ranges(total: usize, start_date: u64, end_date: u64) -> Vec<(u64, u64)> {
-    (0..total)
-        .map(|_| generate_seconds_range(start_date, end_date))
-        .collect()
+pub fn generate_minute_time_ranges(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    count: usize,
+) -> Vec<(u64, u64)> {
+    // Calculate total minutes within the date range
+    let total_minutes = (end - start).num_minutes() as u64;
+
+    let mut ranges = Vec::with_capacity(count);
+    for _ in 0..count {
+        // Randomly select start and end minutes
+        let start_minute = fastrand::u64(0..total_minutes - 1); // exclude last min
+        let end_minute = fastrand::u64(start_minute + 1..total_minutes);
+
+        // Construct DateTime objects with minute alignment
+        let start_time = start + chrono::Duration::minutes(start_minute as i64);
+        let end_time = start + chrono::Duration::minutes(end_minute as i64);
+
+        ranges.push((
+            start_time.timestamp_millis() as u64,
+            end_time.timestamp_millis() as u64,
+        ));
+    }
+    ranges
 }
 
-pub fn generate_seconds_range(start_date: u64, end_date: u64) -> (u64, u64) {
-    // Specify the date range (2023-10-01 to watermark)
-    let start_date = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(start_date);
-    let end_date = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(end_date);
+pub fn generate_hour_time_ranges(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    count: usize,
+) -> Vec<(u64, u64)> {
+    // Calculate total hours within the date range
+    let total_hours = (end - start).num_hours() as u64;
 
-    // Convert dates to Unix timestamps
-    let start_timestamp = start_date
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let end_timestamp = end_date
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let mut ranges = Vec::with_capacity(count);
+    for _ in 0..count {
+        // Randomly select start and end hours
+        let start_hour = fastrand::u64(0..total_hours - 1); // exclude last hour
+        let end_hour = fastrand::u64(start_hour + 1..total_hours);
 
-    // Randomly generate a start time within the specified date range
-    let random_start = fastrand::u64(start_timestamp..end_timestamp);
+        // Construct DateTime objects with minute alignment
+        let start_time = start + chrono::Duration::minutes(start_hour as i64);
+        let end_time = start + chrono::Duration::minutes(end_hour as i64);
 
-    // Generate a random duration between 1 and (watermark - random_start_seconds) seconds
-    let max_duration = end_timestamp - random_start;
-    let duration_seconds = fastrand::u64(1..=max_duration);
-
-    (random_start, random_start + duration_seconds)
+        ranges.push((
+            start_time.timestamp_millis() as u64,
+            end_time.timestamp_millis() as u64,
+        ));
+    }
+    ranges
 }
 
 fn bench_fare_wheel(reader: &ReaderWheel<F64SumAggregator>, ranges: &[(u64, u64)]) {
@@ -212,13 +200,28 @@ fn bench_fare_wheel(reader: &ReaderWheel<F64SumAggregator>, ranges: &[(u64, u64)
 
     for (start, end) in ranges.into_iter().copied() {
         let now = Instant::now();
+
         let _res = reader.combine_range_and_lower(WheelRange::new_unchecked(start, end));
-        hist.record(now.elapsed().as_nanos() as u64).unwrap();
+        let elapsed = now.elapsed().as_micros() as u64;
+        #[cfg(feature = "debug")]
+        println!(
+            "{:#?}",
+            reader
+                .as_ref()
+                .explain_combine_range(WheelRange::new_unchecked(start, end))
+        );
+        hist.record(elapsed).unwrap();
+
         #[cfg(feature = "debug")]
         dbg!(_res);
     }
     let runtime = full.elapsed();
-    println!("µWheel Executed {} queries in {:?}", ranges.len(), runtime);
+    println!(
+        "µWheel Executed {} queries with {:.2}QPS took {:?}",
+        ranges.len(),
+        (ranges.len() as f64 / runtime.as_secs_f64()),
+        runtime
+    );
 
     print_hist("wheel fare", &hist);
 }
@@ -254,7 +257,7 @@ async fn bench_fare_datafusion(ctx: &SessionContext, ranges: &[(u64, u64)]) {
         let now = Instant::now();
         let df = ctx.sql(&query).await.unwrap();
         let res = df.collect().await.unwrap();
-        hist.record(now.elapsed().as_nanos() as u64).unwrap();
+        hist.record(now.elapsed().as_micros() as u64).unwrap();
         let _fare_sum: f64 = res[0]
             .project(&[0])
             .unwrap()
@@ -265,9 +268,11 @@ async fn bench_fare_datafusion(ctx: &SessionContext, ranges: &[(u64, u64)]) {
         dbg!(_fare_sum);
     }
     let runtime = full.elapsed();
+
     println!(
-        "Datafusion Executed {} queries in {:?}",
+        "DataFusion Executed {} queries with {:.2}QPS took {:?}",
         ranges.len(),
+        (ranges.len() as f64 / runtime.as_secs_f64()),
         runtime
     );
 
@@ -276,16 +281,16 @@ async fn bench_fare_datafusion(ctx: &SessionContext, ranges: &[(u64, u64)]) {
 
 fn print_hist(id: &str, hist: &Histogram<u64>) {
     println!(
-        "{} latencies:\t\tmin: {: >4}ns\tp50: {: >4}ns\tp99: {: \
-         >4}ns\tp99.9: {: >4}ns\tp99.99: {: >4}ns\tp99.999: {: >4}ns\t max: {: >4}ns \t count: {}",
+        "{} latencies:\t\tmin: {: >4}µs\tp50: {: >4}µs\tp99: {: \
+         >4}µs\tp99.9: {: >4}µs\tp99.99: {: >4}µs\tp99.999: {: >4}µs\t max: {: >4}µs \t count: {}",
         id,
-        Duration::from_nanos(hist.min()).as_nanos(),
-        Duration::from_nanos(hist.value_at_quantile(0.5)).as_nanos(),
-        Duration::from_nanos(hist.value_at_quantile(0.99)).as_nanos(),
-        Duration::from_nanos(hist.value_at_quantile(0.999)).as_nanos(),
-        Duration::from_nanos(hist.value_at_quantile(0.9999)).as_nanos(),
-        Duration::from_nanos(hist.value_at_quantile(0.99999)).as_nanos(),
-        Duration::from_nanos(hist.max()).as_nanos(),
+        Duration::from_micros(hist.min()).as_micros(),
+        Duration::from_micros(hist.value_at_quantile(0.5)).as_micros(),
+        Duration::from_micros(hist.value_at_quantile(0.99)).as_micros(),
+        Duration::from_micros(hist.value_at_quantile(0.999)).as_micros(),
+        Duration::from_micros(hist.value_at_quantile(0.9999)).as_micros(),
+        Duration::from_micros(hist.value_at_quantile(0.99999)).as_micros(),
+        Duration::from_micros(hist.max()).as_micros(),
         hist.len(),
     );
 }
