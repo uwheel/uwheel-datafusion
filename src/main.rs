@@ -31,7 +31,7 @@ struct Args {
     queries: usize,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
     println!("Running with {:#?}", args);
