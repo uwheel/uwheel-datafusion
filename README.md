@@ -7,6 +7,8 @@ SELECT SUM(fare_amount) FROM yellow_tripdata
 WHERE tpep_dropoff_datetime >= '?' and < '?'
 ```
 
+Created for the following blog [post](https://maxmeldrum.com/docs/posts/2024-05-14-uwheel-datafusion.html).
+
 How to run it:
 
 ```bash
