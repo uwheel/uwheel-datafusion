@@ -13,6 +13,7 @@ use hdrhistogram::Histogram;
 use minstant::Instant;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use uwheel::aggregator::sum::F64SumAggregator;
+use uwheel::wheels::read::aggregation::conf::WheelMode;
 use uwheel::wheels::read::ReaderWheel;
 use uwheel::{Conf, Entry, HawConf, RwWheel};
 use uwheel::{NumericalDuration, WheelRange};
@@ -82,7 +83,9 @@ fn build_fare_wheel(path: &str) -> RwWheel<F64SumAggregator> {
     let date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
     let start_ms = date.timestamp_millis() as u64;
 
-    let mut conf = HawConf::default().with_watermark(start_ms);
+    let mut conf = HawConf::default()
+        .with_watermark(start_ms)
+        .with_mode(WheelMode::Index);
 
     conf.minutes
         .set_retention_policy(uwheel::RetentionPolicy::Keep);
@@ -139,6 +142,11 @@ fn build_fare_wheel(path: &str) -> RwWheel<F64SumAggregator> {
     dbg!(wheel.read().as_ref().hours_unchecked().len());
     dbg!(wheel.read().as_ref().days_unchecked().len());
     dbg!(human_bytes(wheel.size_bytes() as u32));
+
+    // If SIMD is enabled then we make sure the wheels are SIMD compatible after building the index
+    #[cfg(feature = "simd")]
+    wheel.read().to_simd_wheels();
+
     wheel
 }
 

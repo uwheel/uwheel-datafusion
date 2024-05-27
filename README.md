@@ -14,4 +14,6 @@ How to run it:
 ```bash
 ./fetch_data.sh
 cargo run --release --features "mimalloc" -- --queries 20000
+# SIMD-enabled µWheel 
+cargo run --release --features "mimalloc, simd" -- --queries 20000
 ```
